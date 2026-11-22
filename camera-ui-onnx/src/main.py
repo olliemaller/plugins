@@ -65,6 +65,7 @@ from defaults import (
     DEFAULT_EXECUTION_PROVIDER,
     DEFAULT_FACE_DETECTOR,
     DEFAULT_FACE_EMBEDDER,
+    DEFAULT_GPU_MEMORY_MODE,
     DEFAULT_LPD_DETECTOR,
     DEFAULT_OBJECT_MODEL,
     DEFAULT_OCR,
@@ -75,6 +76,9 @@ from defaults import (
     FACE_EMBEDDER_MODELS,
     FACE_EMBEDDERS,
     FACE_LANDMARK_MODEL,
+    GPU_MEMORY_MODES,
+    LEGACY_RUNTIME,
+    LOW_MEMORY_GPU_MAX_BYTES,
     LPD_DETECTOR_MODELS,
     OBJECT_MODELS,
     OCR_ALPHABET,
@@ -92,6 +96,7 @@ from defaults import (
     clip_text_for,
     resolve_model,
 )
+from gpu_info import gpu_total_memory
 from model_manager import OnnxModelManager, ProviderList
 from sensors.clip_sensor import ONNXClipSensor
 from sensors.face_embedder_sensor import ONNXFaceEmbedderSensor
@@ -129,6 +134,7 @@ class ONNXPlugin(
 
         self._sensors: dict[str, dict[str, Any]] = {}
         self._warned_provider: str | None = None
+        self._gpu_total_cache: dict[int, int | None] = {}
 
         self.api.on(API_EVENT.FINISH_LAUNCHING, self._on_start)
         self.api.on(API_EVENT.SHUTDOWN, self._on_shutdown)
@@ -185,6 +191,45 @@ class ONNXPlugin(
                 "store": True,
                 "defaultValue": "0",
                 "onSet": self._on_provider_change,
+            },
+            {
+                "type": "string",
+                "key": "gpu_memory_mode",
+                "title": "GPU Memory Mode",
+                "description": (
+                    "How much GPU memory each model may reserve on CUDA. 'performance' lets cuDNN take the "
+                    "largest workspace it can for speed. 'low' keeps the workspace small and grows each "
+                    "model's memory only by what it needs, for cards that share their memory with other "
+                    "apps. 'auto' picks low on the ONNX Legacy plugin and on cards with 8 GB or less, "
+                    "performance otherwise."
+                ),
+                "enum": GPU_MEMORY_MODES,
+                "store": True,
+                "defaultValue": DEFAULT_GPU_MEMORY_MODE,
+                "required": True,
+                "onSet": self._on_provider_change,
+            },
+            {
+                "type": "number",
+                "key": "gpu_memory_limit_mb",
+                "title": "GPU Memory Limit per Model (MB)",
+                "description": (
+                    "Upper limit for the memory pool of each model on CUDA, 0 for no limit. "
+                    "A model that needs more than the limit falls back to the CPU."
+                ),
+                "store": True,
+                "defaultValue": 0,
+                "minimum": 0,
+                "onSet": self._on_provider_change,
+            },
+            {
+                "type": "string",
+                "key": "gpu_memory_mode_active",
+                "title": "Active GPU Memory Mode",
+                "description": "GPU memory mode the CUDA models were loaded with.",
+                "readonly": True,
+                "store": False,
+                "onGet": self._gpu_memory_mode_summary,
             },
             {
                 "type": "string",
@@ -822,13 +867,59 @@ class ONNXPlugin(
         ids = [int(part.strip()) for part in raw.split(",") if part.strip().isdigit()]
         return ids or [0]
 
-    @staticmethod
-    def _cuda_options(device_id: int) -> dict[str, Any]:
-        return {
+    def _cuda_options(self, device_id: int) -> dict[str, Any]:
+        options: dict[str, Any] = {
             "device_id": device_id,
             "cudnn_conv_algo_search": "HEURISTIC",
-            "cudnn_conv_use_max_workspace": "1",
         }
+        if self._low_memory(device_id):
+            options["cudnn_conv_use_max_workspace"] = "0"
+            options["arena_extend_strategy"] = "kSameAsRequested"
+        else:
+            options["cudnn_conv_use_max_workspace"] = "1"
+        limit_mb = self._gpu_memory_limit_mb()
+        if limit_mb > 0:
+            options["gpu_mem_limit"] = str(limit_mb * 1024 * 1024)
+        return options
+
+    def _gpu_memory_mode(self) -> str:
+        mode = str(self.storage.values.get("gpu_memory_mode", DEFAULT_GPU_MEMORY_MODE))
+        return mode if mode in GPU_MEMORY_MODES else DEFAULT_GPU_MEMORY_MODE
+
+    def _gpu_memory_limit_mb(self) -> int:
+        try:
+            return max(0, int(self.storage.values.get("gpu_memory_limit_mb", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _gpu_total_bytes(self, device_id: int) -> int | None:
+        if device_id not in self._gpu_total_cache:
+            self._gpu_total_cache[device_id] = gpu_total_memory(device_id)
+        return self._gpu_total_cache[device_id]
+
+    def _low_memory(self, device_id: int) -> bool:
+        mode = self._gpu_memory_mode()
+        if mode != "auto":
+            return mode == "low"
+        if LEGACY_RUNTIME:
+            return True
+        total = self._gpu_total_bytes(device_id)
+        return total is not None and total <= LOW_MEMORY_GPU_MAX_BYTES
+
+    def _gpu_memory_mode_summary(self) -> str:
+        parts = []
+        for device_id in self._device_ids():
+            total = self._gpu_total_bytes(device_id)
+            size = f"{total / 1024**3:.1f} GB" if total else "size unknown"
+            mode = "low memory" if self._low_memory(device_id) else "performance"
+            parts.append(f"GPU {device_id} ({size}): {mode}")
+        limit_mb = self._gpu_memory_limit_mb()
+        summary = ", ".join(parts)
+        if self._gpu_memory_mode() == "auto":
+            summary += " (auto)"
+        if limit_mb > 0:
+            summary += f", limit {limit_mb} MB per model"
+        return summary
 
     def _resolve_provider_lists(self) -> list[ProviderList]:
         pref = self.storage.values.get("execution_provider", DEFAULT_EXECUTION_PROVIDER)
@@ -894,7 +985,7 @@ class ONNXPlugin(
     async def _on_provider_change(self, new_value: object, old_value: object) -> None:
         if new_value == old_value:
             return
-        self.logger.log(f"Execution provider setting changed ({old_value} -> {new_value}); reloading models")
+        self.logger.log(f"GPU setting changed ({old_value} -> {new_value}); reloading models")
         self._warned_provider = None
         await self._reload_models()
 

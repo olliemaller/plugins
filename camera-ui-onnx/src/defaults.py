@@ -111,6 +111,11 @@ CLIP_EMBEDDING_DIM = 512
 EXECUTION_PROVIDERS = ["auto", "cpu", "cuda", "tensorrt"]
 DEFAULT_EXECUTION_PROVIDER = "auto"
 
+# low memory trims what each CUDA session reserves, auto picks it for the legacy runtime and small cards
+GPU_MEMORY_MODES = ["auto", "performance", "low"]
+DEFAULT_GPU_MEMORY_MODE = "auto"
+LOW_MEMORY_GPU_MAX_BYTES = 8 * 1024**3 + 512 * 1024**2
+
 DEFAULT_OPTION = "default"
 
 
