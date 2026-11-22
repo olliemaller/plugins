@@ -135,6 +135,7 @@ class ONNXPlugin(
         self._sensors: dict[str, dict[str, Any]] = {}
         self._warned_provider: str | None = None
         self._gpu_total_cache: dict[int, int | None] = {}
+        self._reload_lock = asyncio.Lock()
 
         self.api.on(API_EVENT.FINISH_LAUNCHING, self._on_start)
         self.api.on(API_EVENT.SHUTDOWN, self._on_shutdown)
@@ -220,7 +221,7 @@ class ONNXPlugin(
                 "store": True,
                 "defaultValue": 0,
                 "minimum": 0,
-                "onSet": self._on_provider_change,
+                "onSet": self._on_gpu_memory_limit_change,
             },
             {
                 "type": "string",
@@ -887,10 +888,22 @@ class ONNXPlugin(
         return mode if mode in GPU_MEMORY_MODES else DEFAULT_GPU_MEMORY_MODE
 
     def _gpu_memory_limit_mb(self) -> int:
-        try:
-            return max(0, int(self.storage.values.get("gpu_memory_limit_mb", 0) or 0))
-        except (TypeError, ValueError):
+        return self._limit_mb(self.storage.values.get("gpu_memory_limit_mb", 0))
+
+    @staticmethod
+    def _limit_mb(value: object) -> int:
+        # a first save can report the old value as {} or None, both mean no limit
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
             return 0
+        try:
+            return max(0, int(float(value)))
+        except ValueError:
+            return 0
+
+    async def _on_gpu_memory_limit_change(self, new_value: object, old_value: object) -> None:
+        if self._limit_mb(new_value) == self._limit_mb(old_value):
+            return
+        await self._on_provider_change(new_value, old_value)
 
     def _gpu_total_bytes(self, device_id: int) -> int | None:
         if device_id not in self._gpu_total_cache:
@@ -990,6 +1003,11 @@ class ONNXPlugin(
         await self._reload_models()
 
     async def _reload_models(self) -> None:
+        # settings can fire their callbacks together, two reloads at once would close each other's sessions
+        async with self._reload_lock:
+            await self._reload_models_locked()
+
+    async def _reload_models_locked(self) -> None:
         obj = list(self.object_detectors)
         fdet = list(self.face_detectors)
         femb = list(self.face_embedders)
