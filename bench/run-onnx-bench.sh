@@ -6,8 +6,11 @@ CT=101
 SECS=${1:-60}
 C=$(pct exec $CT -- docker ps --format '{{.Names}}' | grep -i camera | head -1)
 [ -n "$C" ] || { echo "camera.ui container not found"; exit 1; }
-PY=$(pct exec $CT -- docker exec "$C" sh -c 'find / -xdev -path "*camera-ui-onnx-legacy/python-3.11*/bin/python3" 2>/dev/null | head -1')
-MD=$(pct exec $CT -- docker exec "$C" sh -c 'find / -xdev -type d -name models -path "*camera-ui-onnx-legacy*" 2>/dev/null | head -1')
+# camera.ui keeps its data on Docker volumes, so search the container's mount points (find -xdev skips them)
+MOUNTS=$(pct exec $CT -- docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$C")
+echo "mounts: $MOUNTS"
+PY=$(pct exec $CT -- docker exec "$C" sh -c "find $MOUNTS -path '*camera-ui-onnx-legacy/python-3.11*/bin/python3' 2>/dev/null | head -1")
+MD=$(pct exec $CT -- docker exec "$C" sh -c "find $MOUNTS -type d -name models -path '*camera-ui-onnx-legacy*' 2>/dev/null | head -1")
 echo "container=$C python=$PY models=$MD"
 [ -n "$PY" ] && [ -n "$MD" ] || { echo "python or models not found"; exit 1; }
 pct push $CT "$(dirname "$0")/onnx_arena_bench.py" /tmp/onnx_arena_bench.py
